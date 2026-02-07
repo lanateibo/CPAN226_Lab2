@@ -2,15 +2,13 @@
 
 import socket
 import argparse
-import time
 import os
-import struct  # added sequence numbers to support reliability over UDP
+import struct  # IMPROVEMENT: add sequence numbers for reliability over UDP
 
 
 def run_client(target_ip, target_port, input_file):
-    # 1. Create a UDP socket
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(0.25)  #timeout so we can resend if ACK is lost
+    sock.settimeout(0.25)  # IMPROVEMENT: timeout enables resend when ACK is lost
     server_address = (target_ip, target_port)
 
     print(f"[*] Sending file '{input_file}' to {target_ip}:{target_port}")
@@ -20,50 +18,57 @@ def run_client(target_ip, target_port, input_file):
         return
 
     try:
-        seq = 0  #packet sequence number for stop-and-wait reliability
+        seq = 0  # IMPROVEMENT: stop-and-wait sequence number
 
-        with open(input_file, 'rb') as f:
+        with open(input_file, "rb") as f:
             while True:
-                chunk = f.read(4092)  # 4KB chunks
-
+                chunk = f.read(4092)  # IMPROVEMENT: 4092 + 4 header = 4096 max for relay buffer
                 if not chunk:
                     break
 
-                header = struct.pack("!I", seq)  #4-byte big-endian sequence header
-                packet = header + chunk          #attach header to payload
+                packet = struct.pack("!I", seq) + chunk  # IMPROVEMENT: header + payload
 
-                # Stop-and-wait: send until correct ACK received
+                retries = 0  # IMPROVEMENT: track resend attempts
                 while True:
-                    sock.sendto(packet, server_address)  #resend same packet if needed
-
+                    sock.sendto(packet, server_address)  # IMPROVEMENT: resend until ACK received
                     try:
-                        ack, _ = sock.recvfrom(64)  #wait for ACK from server
+                        ack, _ = sock.recvfrom(64)
                         if len(ack) >= 7 and ack[:3] == b"ACK":
                             ack_seq = struct.unpack("!I", ack[3:7])[0]
                             if ack_seq == seq:
-                                break  # correct ACK
+                                break
                     except socket.timeout:
-                        continue  #on timeout, resend packet
+                        retries += 1
+                        if retries % 20 == 0:
+                            print(f"[*] Waiting for ACK seq={seq} (retries={retries})")  # IMPROVEMENT: progress output
+                    except ConnectionResetError:
+                        # IMPROVEMENT: Windows can raise this when relay drops packets; keep retrying
+                        continue
 
-                seq += 1  #only advance after receiving correct ACK
+                seq += 1  # IMPROVEMENT: move to next chunk only after correct ACK
 
-        # Send END marker (instead of empty packet) so EOF survives packet loss
-        end_packet = b"END!" + struct.pack("!I", seq)  #explicit EOF marker with seq
+        # Send END marker reliably (do NOT use empty packet EOF)
+        end_seq = seq
+        end_packet = b"END!" + struct.pack("!I", end_seq)  # IMPROVEMENT: explicit EOF marker survives loss
+
+        retries = 0  # IMPROVEMENT: resend END until ACK
         while True:
-            sock.sendto(end_packet, server_address)  #resend END until ACK
+            sock.sendto(end_packet, server_address)
             try:
                 ack, _ = sock.recvfrom(64)
                 if len(ack) >= 7 and ack[:3] == b"ACK":
                     ack_seq = struct.unpack("!I", ack[3:7])[0]
-                    if ack_seq == seq:
+                    if ack_seq == end_seq:
                         break
             except socket.timeout:
+                retries += 1
+                if retries % 20 == 0:
+                    print(f"[*] Waiting for END ACK (retries={retries})")  # IMPROVEMENT: progress output
+            except ConnectionResetError:
                 continue
 
         print("[*] File transmission complete.")
 
-    except Exception as e:
-        print(f"[!] Error: {e}")
     finally:
         sock.close()
 
@@ -75,4 +80,4 @@ if __name__ == "__main__":
     parser.add_argument("--file", type=str, required=True, help="Path to file to send")
     args = parser.parse_args()
 
-    run_client(args.target_ip, args.target_port, args.target_port and args.file)
+    run_client(args.target_ip, args.target_port, args.file)
